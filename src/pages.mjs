@@ -8,6 +8,7 @@
 
 import { SITE } from './site.mjs';
 import { FAQ } from './faq.mjs';
+import { CONTENT_PAGES } from './content.mjs';
 
 const UPDATED = '2026-10-25';
 
@@ -230,64 +231,6 @@ Start with the free 15-minute fit call: ${SITE.bookingUrl}`,
   },
 
   {
-    path: '/work/',
-    title: 'Work · Real AI builds for small businesses · Aidvance',
-    description:
-      'Examples of what an Aidvance engagement can lead to, starting with Morning Desk: a sales dashboard built on a salesperson\'s email inbox.',
-    h1: 'Work',
-    crumb: 'Work',
-    updated: UPDATED,
-    body: `
-<p class="label">Work</p>
-<h1>Work</h1>
-<p class="lede">What it looks like when the assessment finds something worth building.</p>
-<article class="card">
-  <h2><a href="/work/morning-desk/">Morning Desk</a></h2>
-  <p>Have your inbox work for you. A sales dashboard built for a salesperson at a Manhattan wholesale company, on top of the email inbox he already lived in.</p>
-  <p><a href="/work/morning-desk/">Explore the demo →</a></p>
-</article>
-${bookCta}`,
-    schema: () => [],
-    markdown: `# Work
-
-## Morning Desk
-Have your inbox work for you. A sales dashboard built for a salesperson at a Manhattan wholesale company, on top of the email inbox he already lived in. Demo: ${SITE.origin}/work/morning-desk/`,
-  },
-
-  {
-    path: '/work/morning-desk/',
-    title: 'Morning Desk · A sales dashboard built on your inbox · Aidvance',
-    description:
-      'Morning Desk is a sales dashboard Aidvance built on top of an email inbox, so a salesperson starts the day with the inbox already sorted into work. Sample-data demo.',
-    h1: 'Morning Desk',
-    crumb: 'Morning Desk',
-    parent: { path: '/work/', crumb: 'Work' },
-    updated: UPDATED,
-    body: `
-<p class="label">Work · Case study</p>
-<h1>Morning Desk</h1>
-<p class="lede">A sales dashboard built on your email inbox. Have your inbox work for you.</p>
-<p>Morning Desk was built for a real client: a salesperson at a Manhattan wholesale company whose day ran through his inbox. Instead of adding another tool, it turns the inbox he already uses into a morning dashboard of the work that needs doing.</p>
-<p>The demo below runs on sample data. Click around.</p>
-<!-- The interactive Morning Desk demo mounts here. -->
-<div id="morning-desk-demo" class="demo-mount" data-demo-mount>
-  <p class="fine">The interactive demo needs JavaScript.</p>
-</div>
-${bookCta}`,
-    schema: () => [
-      {
-        '@type': 'CreativeWork',
-        name: 'Morning Desk',
-        description: 'A sales dashboard built on top of an email inbox for a salesperson at a Manhattan wholesale company.',
-        creator: { '@id': `${SITE.origin}/#org` },
-      },
-    ],
-    markdown: `# Morning Desk
-
-A sales dashboard built on your email inbox. Built for a real client: a salesperson at a Manhattan wholesale company whose day ran through his inbox. Instead of adding another tool, it turns the inbox he already uses into a morning dashboard of the work that needs doing. A sample-data demo is on the page.`,
-  },
-
-  {
     path: '/about/',
     title: 'About Aidvance · One person, no software to sell you',
     description:
@@ -436,4 +379,5 @@ ${bookCta}`,
 
 A free seven-step estimator on the Aidvance site that gives a rough range for what AI companies pay for business data like yours. Your website is optional and only gives context. It's a rough range, not an offer.`,
   },
+  ...CONTENT_PAGES,
 ];
