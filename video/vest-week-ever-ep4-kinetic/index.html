@@ -1,0 +1,499 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>html,body{margin:0;background:#000;overflow:hidden}canvas{display:block}</style>
+</head><body>
+<canvas id="c"></canvas>
+<script>
+// ---------- config ----------
+const P = new URLSearchParams(location.search);
+const W = +(P.get('w') || 1920), H = +(P.get('h') || 1080);
+const FPS = 30, BPM = +(P.get('bpm') || 140), SPB = 60 / BPM;
+const OFFSET = +(P.get('offset') || 0);        // seconds of music before beat 0
+const SUB = +(P.get('sub') || 8);               // motion-blur subframes
+const SHUTTER = 0.5;                            // 180 degrees
+const U = Math.min(W, H) / 1080;                // unit scale
+const END_BEAT = 72;
+const TOTAL = OFFSET + END_BEAT * SPB;
+
+const C = {
+  ink: '#07090a', deep: '#0b231c', green: '#00d98e', mint: '#9dffd6',
+  paper: '#efede6', white: '#ffffff', dim: '#6d7a74'
+};
+
+// ---------- canvas ----------
+const cv = document.getElementById('c'); cv.width = W; cv.height = H;
+const out = cv.getContext('2d');
+const off = document.createElement('canvas'); off.width = W; off.height = H;
+const ctx = off.getContext('2d');
+
+// grain tile
+const grain = document.createElement('canvas'); grain.width = grain.height = 512;
+{ const g = grain.getContext('2d'), id = g.createImageData(512, 512);
+  let s = 1234567; const r = () => (s = (s * 1103515245 + 12345) >>> 0) / 4294967296;
+  for (let i = 0; i < id.data.length; i += 4) { const v = r() * 255; id.data[i] = id.data[i+1] = id.data[i+2] = v; id.data[i+3] = 255; }
+  g.putImageData(id, 0, 0); }
+
+// ---------- math ----------
+const clamp = (x, a = 0, b = 1) => Math.max(a, Math.min(b, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const inv = (a, b, x) => clamp((x - a) / (b - a));
+const eOutExpo = t => t >= 1 ? 1 : 1 - Math.pow(2, -10 * t);
+const eInExpo = t => t <= 0 ? 0 : Math.pow(2, 10 * t - 10);
+const eInOut = t => t < .5 ? 4*t*t*t : 1 - Math.pow(-2*t + 2, 3) / 2;
+const eOutBack = (t, k = 1.7) => 1 + (k + 1) * Math.pow(t - 1, 3) + k * Math.pow(t - 1, 2);
+const eOutElastic = t => t <= 0 ? 0 : t >= 1 ? 1 : Math.pow(2, -10*t) * Math.sin((t*10 - .75) * (2*Math.PI/3)) + 1;
+// punch: 1 at rest, overshoot right after hit
+const punch = (dt, amt = .25, dur = .5) => dt < 0 ? 1 : 1 + amt * Math.exp(-dt / (dur * .35)) * Math.cos(dt / dur * 9);
+function hash(n) { const x = Math.sin(n * 127.1) * 43758.5453; return x - Math.floor(x); }
+
+// ---------- text ----------
+const F = {
+  anton: s => `${s}px Anton`, black: s => `${s}px ArchivoBlack`,
+  wide: s => `900 ${s}px ArchivoVar`, grot: (s, w = 700) => `${w} ${s}px Grotesk`,
+  mono: (s, w = 500) => `${w} ${s}px "JetBrains Mono"`
+};
+function text(str, x, y, font, color, o = {}) {
+  ctx.save();
+  ctx.font = font; ctx.fillStyle = color; ctx.textAlign = o.align || 'center';
+  ctx.textBaseline = o.base || 'middle';
+  ctx.letterSpacing = (o.ls || 0) + 'px';
+  ctx.translate(x, y);
+  if (o.rot) ctx.rotate(o.rot);
+  ctx.scale((o.sx || 1) * (o.s || 1), (o.sy || 1) * (o.s || 1));
+  if (o.alpha !== undefined) ctx.globalAlpha *= o.alpha;
+  if (o.glow) { ctx.shadowColor = o.glow; ctx.shadowBlur = o.glowR || 40 * U; }
+  if (o.stroke) { ctx.lineWidth = o.stroke; ctx.strokeStyle = color; ctx.strokeText(str, 0, 0); }
+  else ctx.fillText(str, 0, 0);
+  ctx.restore();
+}
+function measure(str, font, ls = 0) { ctx.save(); ctx.font = font; ctx.letterSpacing = ls + 'px'; const m = ctx.measureText(str).width; ctx.restore(); return m; }
+// font size so that str fills width w
+function fit(str, fontFn, w, ls = 0) { const m = measure(str, fontFn(100), ls); return 100 * w / m; }
+
+// extruded 3D text: depth layers along direction (dx,dy)
+function extrude(str, x, y, font, o) {
+  const n = o.layers || 28, dx = o.dx, dy = o.dy;
+  ctx.save(); ctx.font = font; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.letterSpacing = (o.ls || 0) + 'px';
+  ctx.translate(x, y); ctx.scale(o.sx || 1, o.sy || 1);
+  for (let i = n; i >= 1; i--) {
+    const k = i / n;
+    ctx.fillStyle = o.side(k);
+    ctx.fillText(str, dx * k, dy * k);
+  }
+  const g = ctx.createLinearGradient(0, -o.size * .5, 0, o.size * .5);
+  g.addColorStop(0, o.face0); g.addColorStop(1, o.face1);
+  ctx.fillStyle = g;
+  if (o.glow) { ctx.shadowColor = o.glow; ctx.shadowBlur = 60 * U; }
+  ctx.fillText(str, 0, 0);
+  ctx.shadowBlur = 0;
+  ctx.lineWidth = 2.5 * U; ctx.strokeStyle = 'rgba(255,255,255,.55)'; ctx.strokeText(str, 0, 0);
+  ctx.restore();
+}
+
+function bg(color) { ctx.fillStyle = color; ctx.fillRect(-W, -H, W * 3, H * 3); }
+function rays(color, n, rot, alpha, inner = 0) {
+  ctx.save(); ctx.rotate(rot); ctx.globalAlpha = alpha; ctx.fillStyle = color;
+  const R = Math.hypot(W, H);
+  for (let i = 0; i < n; i++) {
+    const a = i / n * Math.PI * 2, w = Math.PI / n * .55;
+    ctx.beginPath(); ctx.moveTo(Math.cos(a) * inner, Math.sin(a) * inner);
+    ctx.lineTo(Math.cos(a - w) * R, Math.sin(a - w) * R); ctx.lineTo(Math.cos(a + w) * R, Math.sin(a + w) * R); ctx.fill();
+  }
+  ctx.restore();
+}
+function grid(color, alpha, spacing, shift) {
+  ctx.save(); ctx.globalAlpha = alpha; ctx.strokeStyle = color; ctx.lineWidth = 1.5 * U;
+  const s = spacing * U, ox = ((shift % s) + s) % s;
+  for (let x = -W / 2 - s + ox; x < W / 2 + s; x += s) { ctx.beginPath(); ctx.moveTo(x, -H/2); ctx.lineTo(x, H/2); ctx.stroke(); }
+  for (let y = -H / 2; y < H / 2 + s; y += s) { ctx.beginPath(); ctx.moveTo(-W/2, y); ctx.lineTo(W/2, y); ctx.stroke(); }
+  ctx.restore();
+}
+function flash(color, a) { if (a <= 0.001) return; ctx.save(); ctx.globalAlpha = a; bg(color); ctx.restore(); }
+
+// slot reel: shows value v (float, integer = settled) of digit chars
+function reel(chars, v, x, y, size, font, color, cellH) {
+  const n = chars.length, h = cellH || size * 1.05;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(x - size * .45, y - h * .5, size * .9, h); ctx.clip();
+  const base = Math.floor(v), fr = v - base;
+  for (let k = -1; k <= 1; k++) {
+    const idx = (((base + k) % n) + n) % n;
+    text(chars[idx], x, y + (k - fr) * h, font, color);
+  }
+  ctx.restore();
+}
+
+// ---------- events (sound cues), in beats ----------
+const EVENTS = [];
+const ev = (b, type, gain = 1) => EVENTS.push({ beat: b, type, gain });
+
+// ---------- scenes ----------
+// each scene: [start, end, fn(lb, b)] where lb = beats since scene start
+const S = [];
+const scene = (a, b, fn, o = {}) => S.push({ a, b, fn, whipIn: o.whipIn, whipOut: o.whipOut });
+
+// S1 typed intro
+const INTRO = 'ALL THINGS CRYPTO';
+scene(0, 4, (lb) => {
+  bg(C.ink);
+  grid(C.green, .05, 120, lb * 30);
+  const push = 1 + lb * .03;
+  ctx.save(); ctx.scale(push, push);
+  const n = Math.floor(clamp(lb / 1.9) * INTRO.length);
+  const s = INTRO.slice(0, n);
+  const fs = 64 * U;
+  const wFull = measure(INTRO, F.mono(fs, 700), 10 * U);
+  text(s, -wFull / 2, -20 * U, F.mono(fs, 700), C.paper, { align: 'left', ls: 10 * U });
+  const cw = measure(s, F.mono(fs, 700), 10 * U);
+  if ((lb * 2) % 1 < .6 && lb < 3.6) { ctx.fillStyle = C.green; ctx.fillRect(-wFull / 2 + cw + 6 * U, -20 * U - fs * .45, fs * .5, fs * .9); }
+  const pr = eOutExpo(inv(2.5, 3.0, lb));
+  text('PRESENTS', 0, 70 * U + (1 - pr) * 30 * U, F.grot(30 * U), C.green, { ls: 18 * U, alpha: pr });
+  ctx.restore();
+}, { whipOut: true });
+for (let i = 0; i < INTRO.length; i++) if (INTRO[i] !== ' ') ev(i / INTRO.length * 1.9, 'key', .7);
+ev(2.5, 'tick', .8);
+
+// S2 word slams with colour flips
+const SLAMS = [[4, "IT'S", C.ink, C.paper], [5, 'FRIDAY.', C.green, C.ink], [6, 'YOU KNOW', C.ink, C.green], [6.5, 'WHAT', C.paper, C.ink], [7, 'THAT MEANS.', C.ink, C.paper]];
+scene(4, 8, (lb, b) => {
+  let cur = SLAMS[0];
+  for (const s of SLAMS) if (b >= s[0]) cur = s;
+  const dt = b - cur[0];
+  bg(cur[2]);
+  const sc = lerp(1.35, 1, eOutExpo(clamp(dt / .35))) * punch(dt, .04, .4);
+  const fs = Math.min(fit(cur[1], F.anton, W * .82), 520 * U);
+  ctx.save(); ctx.rotate(lerp(-.05, 0, eOutExpo(clamp(dt / .3))) * (cur[0] % 1 ? -1 : 1));
+  text(cur[1], 0, 10 * U, F.anton(fs), cur[3], { s: sc });
+  ctx.restore();
+  // ghost echo
+  text(cur[1], 0, 10 * U, F.anton(fs), cur[3], { s: sc * (1 + dt * .5), alpha: .18 * (1 - clamp(dt / .5)), stroke: 3 * U });
+}, { whipIn: true });
+for (const s of SLAMS) ev(s[0], 'hit', s[0] === 5 ? 1 : .8);
+
+// S3 strike
+scene(8, 12, (lb) => {
+  const strike = eOutExpo(inv(1.75, 2.15, lb));
+  const noT = lb - 3;
+  if (noT >= 0) {
+    bg(C.green);
+    rays(C.ink, 18, lb * .2, .08);
+    const fs = 620 * U * lerp(1.5, 1, eOutExpo(clamp(noT / .3)));
+    extrude('NO.', 0, 20 * U, F.black(fs), { size: fs, dx: 26 * U, dy: 30 * U, layers: 22, side: k => `rgb(${lerp(4,0,k)},${lerp(70,25,k)},${lerp(48,18,k)})`, face0: '#0a0d0c', face1: '#14201b' });
+    return;
+  }
+  bg(C.ink);
+  grid(C.dim, .08, 90, -lb * 20);
+  const l1 = eOutExpo(inv(0, .35, lb)), l2 = eOutExpo(inv(.5, .85, lb)), l3 = eOutExpo(inv(1, 1.35, lb));
+  const fs = 150 * U;
+  text('ANOTHER', -0 * U, -170 * U, F.anton(fs), C.paper, { alpha: l1, s: lerp(1.2, 1, l1) });
+  text('QUIET WEEK', 0, 0, F.anton(fs * 1.25), C.paper, { alpha: l2, s: lerp(1.2, 1, l2) });
+  text('IN CRYPTO?', 0, 175 * U, F.anton(fs), C.paper, { alpha: l3, s: lerp(1.2, 1, l3) });
+  if (strike > 0) {
+    ctx.save(); ctx.rotate(-.12); ctx.fillStyle = C.green; ctx.shadowColor = C.green; ctx.shadowBlur = 40 * U;
+    ctx.fillRect(-W * .45, -16 * U, W * .9 * strike, 32 * U); ctx.restore();
+  }
+}, { whipIn: true });
+ev(8, 'hit', .55); ev(8.5, 'hit', .55); ev(9, 'hit', .55); ev(9.75, 'slash', 1); ev(11, 'boom', 1);
+
+// S4 countdown 3 2 1, then a breath
+scene(12, 16, (lb) => {
+  const k = Math.floor(lb);
+  if (lb < 3) {
+    const colors = [[C.ink, C.green], [C.paper, C.ink], [C.green, C.ink]];
+    const [g, f] = colors[k];
+    bg(g);
+    const dt = lb - k;
+    rays(f, 24, -lb * .3, .06);
+    const s = lerp(1.6, 1, eOutExpo(clamp(dt / .3))) * (1 + dt * .08);
+    text(String(3 - k), 0, 30 * U, F.black(760 * U), f, { s });
+  } else {
+    bg('#000');
+    const t = lb - 3, a = eOutExpo(clamp(t / .4));
+    text('THE', 0, 0, F.grot(54 * U), C.paper, { ls: 40 * U * lerp(2, 1, a), alpha: a });
+  }
+}, { whipIn: true });
+ev(12, 'hit', .9); ev(13, 'hit', .9); ev(14, 'hit', .9); ev(15, 'riserCut', 1);
+
+// S5 DROP: hero title in 3D
+scene(16, 24, (lb, b) => {
+  bg(C.ink);
+  const dt = lb;
+  rays(C.green, 28, lb * .25, .12 + .1 * Math.exp(-dt * 2), 80 * U);
+  // radial glow
+  const rg = ctx.createRadialGradient(0, 0, 0, 0, 0, W * .6);
+  rg.addColorStop(0, 'rgba(0,217,142,.35)'); rg.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = rg; ctx.fillRect(-W, -H, W * 2, H * 2);
+  // orbit
+  const ang = Math.sin(lb / 8 * Math.PI * 1.2 - .6) * .55;
+  const sc = lerp(2.6, 1, eOutExpo(clamp(dt / .45))) * punch(dt - 4, .05, .5) * (1 + lb * .012);
+  const fs = 470 * U;
+  ctx.save(); ctx.scale(sc, sc);
+  const th = eOutExpo(clamp(dt / .3));
+  text('THE', 0, -300 * U, F.grot(46 * U), C.paper, { ls: 40 * U, alpha: th });
+  extrude('VEST', 0, -40 * U, F.black(fs), {
+    size: fs, sx: lerp(.9, 1, Math.cos(ang)), dx: Math.sin(ang) * 70 * U, dy: 40 * U, layers: 34,
+    side: k => `rgb(${lerp(0,2,k)|0},${lerp(150,30,k)|0},${lerp(100,22,k)|0})`,
+    face0: '#b8ffe4', face1: C.green, glow: 'rgba(0,217,142,.6)'
+  });
+  const w1 = eOutExpo(inv(2, 2.3, lb)), w2 = eOutExpo(inv(4, 4.3, lb));
+  const fs2 = 168 * U;
+  text('WEEK', -250 * U, 255 * U, F.anton(fs2), C.paper, { alpha: w1, s: lerp(1.8, 1, w1) * punch(lb - 2, .06, .4), ls: 6 * U });
+  text('EVER', 250 * U, 255 * U, F.anton(fs2), C.green, { alpha: w2, s: lerp(1.8, 1, w2) * punch(lb - 4, .06, .4), ls: 6 * U, glow: 'rgba(0,217,142,.7)' });
+  ctx.restore();
+  flash('#fff', Math.exp(-dt * 7) * .95);
+  flash(C.green, Math.exp(-(lb - 4) * 9) * .35 * (lb >= 4));
+});
+ev(16, 'drop', 1); ev(18, 'hit', .9); ev(20, 'hit', 1);
+
+// S6 EPISODE 04 slot reel
+scene(24, 28, (lb) => {
+  bg(C.green);
+  grid(C.ink, .08, 110, lb * 60);
+  const a = eOutExpo(clamp(lb / .3));
+  text('EPISODE', -330 * U + (1 - a) * -300 * U, 0, F.anton(230 * U), C.ink, { alpha: a, ls: 4 * U });
+  const spin = lb < 2 ? lb * 9 : 18 + eOutBack(clamp((lb - 2) / .5), 2.2) * 4; // lands on 22 -> idx 2? set chars
+  const D = '0123456789';
+  // tens digit 0, ones digit lands on 4
+  const ones = lb < 2 ? lb * 14 : lerp(28, 34, eOutBack(clamp((lb - 2) / .45), 2));
+  const tens = lb < 1.5 ? lb * 11 : lerp(16.5, 20, eOutBack(clamp((lb - 1.5) / .45), 2));
+  const fs = 480 * U;
+  ctx.save(); ctx.fillStyle = C.ink; ctx.fillRect(100 * U, -260 * U, 640 * U, 520 * U); ctx.restore();
+  reel(D, tens, 270 * U, 20 * U, fs, F.black(fs), C.green, 520 * U);
+  reel(D, ones, 570 * U, 20 * U, fs, F.black(fs), C.green, 520 * U);
+  const l = eOutExpo(inv(2.4, 2.8, lb));
+  text('FRI · OCT 30', 420 * U, 330 * U, F.grot(38 * U), C.ink, { ls: 10 * U, alpha: l });
+}, { whipIn: true });
+for (let i = 0; i < 8; i++) ev(24 + i * .25, 'tick', .5);
+ev(26, 'hit', 1);
+
+// S7 fly-through words
+const FLY = [[28, 'LIVE', C.paper], [29.5, 'ON', C.paper], [31, 'X', C.green], [33, 'TODAY.', C.green]];
+scene(28, 36, (lb, b) => {
+  bg(C.ink);
+  // speed lines
+  ctx.save(); ctx.strokeStyle = 'rgba(0,217,142,.35)'; ctx.lineWidth = 2 * U;
+  for (let i = 0; i < 70; i++) {
+    const a = hash(i) * Math.PI * 2, z = ((hash(i + 9) - b * .6) % 1 + 1) % 1;
+    const r0 = 60 * U / (z + .05), r1 = 60 * U / (z + .12);
+    ctx.beginPath(); ctx.moveTo(Math.cos(a) * r1, Math.sin(a) * r1); ctx.lineTo(Math.cos(a) * r0, Math.sin(a) * r0); ctx.stroke();
+  }
+  ctx.restore();
+  // draw far words first
+  const list = FLY.map(([h, w, c], i) => ({ h, w, c, i, z: (h - b) * .55 + .35 })).sort((a, b) => b.z - a.z);
+  for (const o of list) {
+    if (o.z <= .02 || o.z > 3) continue;
+    const s = .35 / o.z;
+    const alpha = clamp((3 - o.z) / 1.2) * (o.z < .12 ? o.z / .12 : 1);
+    const ox = (o.i % 2 ? 1 : -1) * 60 * U * (1 - s * .2);
+    const last = o.w === 'TODAY.';
+    if (last && b < 31.7) continue;
+    if (last && b >= o.h) {
+      // settle
+      const dt = b - o.h, ss = lerp(1.4, 1, eOutExpo(clamp(dt / .3))) * punch(dt, .04, .4);
+      extrude('TODAY.', 0, 0, F.black(300 * U), { size: 300 * U, sx: ss, sy: ss, dx: 0, dy: 26 * U * ss, layers: 20, side: k => `rgb(0,${lerp(120,20,k)|0},${lerp(85,15,k)|0})`, face0: '#c9ffea', face1: C.green, glow: 'rgba(0,217,142,.5)' });
+      continue;
+    }
+    text(o.w, ox * s, 0, F.black(300 * U), o.c, { s, alpha });
+  }
+}, { whipIn: true });
+for (const f of FLY) ev(f[0] - .35, 'whoosh', .8);
+ev(33, 'hit', 1);
+
+// S8 stretch FRIDAY / 4 PM ET (variable width feel via scaleX)
+scene(36, 40, (lb) => {
+  bg(C.paper);
+  const pulse = k => Math.exp(-Math.max(0, lb - k) * 4) * (lb >= k);
+  let sx = 1 + .55 * Math.sin(lb * Math.PI * .5) ** 2;
+  sx = lerp(sx, 1, 0);
+  const fs = 360 * U;
+  const base = measure('4 PM ET', F.anton(fs), 0);
+  const tgt = W * .62;
+  const squash = 1 + .18 * pulse(0) + .18 * pulse(1) + .18 * pulse(2) + .25 * pulse(3);
+  const s = tgt / base;
+  text('4 PM ET', 0, -40 * U, F.anton(fs), C.ink, { sx: s * squash * (lb < 2 ? lerp(.4, 1, eOutElastic(clamp(lb / .9))) : 1), sy: s / Math.sqrt(squash) });
+  ctx.save(); ctx.fillStyle = C.green; const bw = W * .78 * eOutExpo(inv(0, .6, lb)); ctx.fillRect(-bw / 2, 210 * U, bw, 14 * U); ctx.restore();
+  const l = eOutExpo(inv(1, 1.4, lb));
+  text('EASTERN · FRIDAY OCT 30', 0, 290 * U, F.grot(40 * U), C.ink, { ls: 14 * U, alpha: l });
+}, { whipIn: true });
+ev(36, 'hit', .9); ev(37, 'tick', .7); ev(38, 'tick', .7); ev(39, 'hit', .8);
+
+// S9 clock 3:59 -> 4:00
+scene(40, 44, (lb) => {
+  const flip = lb >= 2;
+  bg(flip ? C.green : C.ink);
+  if (flip) rays(C.ink, 20, lb * .2, .07);
+  const fs = 440 * U, col = flip ? C.ink : C.green;
+  const D = '0123456789';
+  const t = eOutBack(clamp((lb - 2) / .4), 2);
+  const tick = Math.floor(lb * 2) / 2;
+  // seconds ticker before flip
+  const h = lerp(3, 4, t), m1 = lerp(5, 10, t), m2 = lerp(9, 10, t);
+  const cell = 470 * U;
+  ctx.save(); ctx.scale(punch(lb - 2, .06, .5), punch(lb - 2, .06, .5));
+  reel(D, h, -390 * U, 0, fs, F.black(fs), col, cell);
+  text(':', -190 * U, -20 * U, F.black(fs), col, { alpha: (lb * 2 % 1 < .6 || flip) ? 1 : .2 });
+  reel(D, m1, 10 * U, 0, fs, F.black(fs), col, cell);
+  reel(D, m2, 300 * U, 0, fs, F.black(fs), col, cell);
+  text('PM', 560 * U, -80 * U, F.anton(120 * U), col);
+  text('ET', 560 * U, 60 * U, F.anton(120 * U), col);
+  ctx.restore();
+  const cap = flip ? "WE'RE LIVE." : 'ONE MINUTE.';
+  text(cap, 0, 360 * U, F.grot(40 * U), flip ? C.ink : C.paper, { ls: 20 * U });
+  flash('#fff', flip ? Math.exp(-(lb - 2) * 8) * .8 : 0);
+}, { whipIn: true });
+ev(40, 'tick', .7); ev(40.5, 'tick', .7); ev(41, 'tick', .7); ev(41.5, 'tick', .7); ev(42, 'boom', 1);
+
+// S10 chain: DAVE — NAT — YOU (one camera move)
+scene(44, 52, (lb) => {
+  bg(C.ink);
+  grid(C.green, .06, 100, -lb * 40);
+  const nodes = [[0, 'DAVE', -800], [2.5, 'NAT', 0], [5, 'YOU.', 800]];
+  const camX = lerp(-800, 800, eInOut(inv(.2, 5.6, lb))) * U;
+  const camS = lerp(1.05, .92, inv(5.6, 8, lb));
+  ctx.save(); ctx.scale(camS, camS); ctx.translate(-camX, 0);
+  // line
+  const prog = eInOut(inv(.4, 5.4, lb));
+  ctx.save(); ctx.strokeStyle = C.green; ctx.lineWidth = 8 * U; ctx.shadowColor = C.green; ctx.shadowBlur = 30 * U; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(-800 * U, 150 * U); ctx.lineTo(lerp(-800, 800, prog) * U, 150 * U); ctx.stroke();
+  ctx.restore();
+  for (const [h, w, x] of nodes) {
+    const a = eOutExpo(inv(h, h + .35, lb));
+    const dt = lb - h;
+    ctx.save(); ctx.fillStyle = C.green; ctx.shadowColor = C.green; ctx.shadowBlur = 30 * U;
+    ctx.beginPath(); ctx.arc(x * U, 150 * U, 18 * U * a * punch(dt, .4, .4), 0, Math.PI * 2); ctx.fill(); ctx.restore();
+    const col = w === 'YOU.' ? C.green : C.paper;
+    text(w, x * U, -60 * U, F.anton(300 * U), col, { alpha: a, s: lerp(1.5, 1, a) * punch(dt, .05, .4), glow: w === 'YOU.' ? 'rgba(0,217,142,.6)' : undefined });
+    const sub = w === 'DAVE' ? 'HOST' : w === 'NAT' ? 'CO-HOST' : 'BRING QUESTIONS';
+    text(sub, x * U, 230 * U, F.grot(34 * U), C.dim, { ls: 14 * U, alpha: eOutExpo(inv(h + .3, h + .7, lb)) });
+  }
+  ctx.restore();
+  const tl = eOutExpo(inv(6.2, 6.6, lb));
+  text('THE VEST WEEK EVER', 0, -380 * U, F.grot(36 * U), C.green, { ls: 22 * U, alpha: tl });
+}, { whipIn: true });
+ev(44, 'hit', .9); ev(46.5, 'hit', .9); ev(49, 'hit', 1); ev(44.4, 'whooshLong', .6);
+
+// S11 rapid topics
+const TOP = [[52, 'PERPS.', C.ink, C.paper], [53, 'PROP.', C.green, C.ink], [54, 'FUNDED.', C.paper, C.ink], [55, 'YOUR QUESTIONS.', C.ink, C.green]];
+scene(52, 56, (lb, b) => {
+  let cur = TOP[0]; for (const t of TOP) if (b >= t[0]) cur = t;
+  const dt = b - cur[0];
+  bg(cur[2]);
+  const fs = Math.min(fit(cur[1], F.anton, W * .86), 560 * U);
+  const sc = lerp(.6, 1, eOutBack(clamp(dt / .3), 2.4));
+  text(cur[1], 0, 10 * U, F.anton(fs), cur[3], { s: sc });
+  // edge ticker
+  text('THE VEST WEEK EVER · EP 04 · LIVE ON X · ', (-(b * 300) % 900) * U, 470 * U, F.grot(26 * U), cur[3], { align: 'left', ls: 10 * U, alpha: .6 });
+}, { whipIn: true });
+for (const t of TOP) ev(t[0], 'hit', .85);
+
+// S12 CODE ATC
+scene(56, 60, (lb) => {
+  bg(C.ink);
+  rays(C.green, 30, -lb * .2, .1, 60 * U);
+  const a = eOutExpo(clamp(lb / .3));
+  text('GET FUNDED WITH', 0, -270 * U, F.grot(46 * U), C.paper, { ls: 20 * U, alpha: a });
+  const c = eOutExpo(inv(1, 1.3, lb));
+  const fs = 330 * U;
+  if (lb >= 1) extrude('CODE ATC', 0, -20 * U, F.black(fs), { size: fs, sx: lerp(1.6, 1, c) * punch(lb - 1, .04, .5), sy: lerp(1.6, 1, c) * punch(lb - 1, .04, .5), dx: 0, dy: 30 * U, layers: 26, side: k => `rgb(0,${lerp(130,22,k)|0},${lerp(92,16,k)|0})`, face0: '#d2ffee', face1: C.green, glow: 'rgba(0,217,142,.55)' });
+  const url = 'next.vestmarkets.com/r/4nallthingscrypto';
+  const n = Math.floor(clamp((lb - 2) / 1.3) * url.length);
+  text(url.slice(0, n), 0, 250 * U, F.mono(44 * U, 600), C.paper, {});
+  flash(C.green, lb >= 1 ? Math.exp(-(lb - 1) * 8) * .5 : 0);
+}, { whipIn: true });
+ev(56, 'hit', .7); ev(57, 'boom', 1);
+for (let i = 0; i < 40; i += 2) ev(58 + i / 40 * 1.3, 'key', .45);
+
+// S13 end card
+scene(60, 72, (lb) => {
+  bg(C.ink);
+  const rg = ctx.createRadialGradient(0, -100 * U, 0, 0, -100 * U, W * .7);
+  rg.addColorStop(0, 'rgba(0,217,142,.18)'); rg.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = rg; ctx.fillRect(-W, -H, W * 2, H * 2);
+  const push = 1 + lb * .006;
+  ctx.save(); ctx.scale(push, push);
+  const r = (k) => eOutExpo(inv(k, k + .5, lb));
+  text('THE', 0, -360 * U, F.grot(36 * U), C.paper, { ls: 30 * U, alpha: r(0) });
+  extrude('VEST', 0, -215 * U, F.black(230 * U), { size: 230 * U, dx: 0, dy: 18 * U, layers: 16, side: k => `rgb(0,${lerp(120,20,k)|0},${lerp(85,15,k)|0})`, face0: '#c9ffea', face1: C.green, sx: lerp(1.3, 1, r(0)), sy: lerp(1.3, 1, r(0)) });
+  text('WEEK EVER', 0, -55 * U, F.anton(120 * U), C.paper, { ls: 8 * U, alpha: r(.25) });
+  text('EPISODE 4  ·  FRIDAY OCT 30  ·  4 PM ET  ·  LIVE ON X', 0, 55 * U, F.grot(38 * U), C.green, { ls: 4 * U, alpha: r(.6) });
+  text('WITH DAVE & NAT', 0, 115 * U, F.grot(32 * U, 500), C.paper, { ls: 12 * U, alpha: r(.8) });
+  // offer box
+  const bx = r(1.4);
+  ctx.save(); ctx.globalAlpha = bx; ctx.strokeStyle = C.green; ctx.lineWidth = 3 * U;
+  const bw = 1180 * U, bh = 150 * U; ctx.strokeRect(-bw / 2, 175 * U, bw, bh); ctx.restore();
+  text('next.vestmarkets.com/r/4nallthingscrypto', 0, 220 * U, F.mono(38 * U, 600), C.paper, { alpha: bx });
+  text('CODE  ATC', 0, 283 * U, F.anton(52 * U), C.green, { ls: 10 * U, alpha: bx });
+  text("We're Vest affiliates. Not financial advice.", 0, 400 * U, F.grot(28 * U, 500), '#b9c4bf', { alpha: r(1.8) });
+  ctx.restore();
+  flash('#fff', Math.exp(-lb * 6) * .7);
+});
+ev(60, 'final', 1);
+
+// ---------- frame composition ----------
+const WHIP = .3; // beats
+function sceneAt(b) { for (const s of S) if (b >= s.a && b < s.b) return s; return S[S.length - 1]; }
+function drawScene(s, b, dx) {
+  ctx.save(); ctx.translate(W / 2 + dx, H / 2);
+  s.fn(b - s.a, b);
+  ctx.restore();
+}
+function shakeAt(b) {
+  let sx = 0, sy = 0;
+  for (const e of EVENTS) {
+    if (!['drop', 'boom', 'final', 'hit'].includes(e.type)) continue;
+    const dt = (b - e.beat) * SPB; if (dt < 0 || dt > .5) continue;
+    const amp = (e.type === 'hit' ? 6 : 18) * U * e.gain * Math.exp(-dt * 12);
+    sx += Math.sin(dt * 90 + e.beat) * amp; sy += Math.cos(dt * 77 + e.beat * 3) * amp;
+  }
+  return [sx, sy];
+}
+function renderAt(t) {
+  const b = (t - OFFSET) / SPB;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (b < 0) { ctx.fillStyle = C.ink; ctx.fillRect(0, 0, W, H); return; }
+  const [sx, sy] = shakeAt(b);
+  ctx.setTransform(1, 0, 0, 1, sx, sy);
+  const s = sceneAt(b);
+  const idx = S.indexOf(s), next = S[idx + 1];
+  // whip into next scene during last WHIP beats of this one
+  if (next && next.whipIn && b > s.b - WHIP) {
+    const p = eInExpo(inv(s.b - WHIP, s.b, b));
+    drawScene(s, b, -p * W * 1.1);
+    drawScene(next, next.a, (1 - p) * W * 1.1);
+  } else if (s.whipIn && b < s.a + WHIP * .6) {
+    const p = eOutExpo(inv(s.a, s.a + WHIP * .6, b));
+    drawScene(s, b, (1 - p) * W * .25);
+  } else drawScene(s, b, 0);
+}
+function finish(frame) {
+  // vignette + grain on output
+  out.save();
+  const v = out.createRadialGradient(W / 2, H / 2, H * .35, W / 2, H / 2, H * .95);
+  v.addColorStop(0, 'rgba(0,0,0,0)'); v.addColorStop(1, 'rgba(0,0,0,.45)');
+  out.fillStyle = v; out.fillRect(0, 0, W, H);
+  out.globalAlpha = .07; out.globalCompositeOperation = 'overlay';
+  const ox = Math.floor(hash(frame) * 512), oy = Math.floor(hash(frame + .5) * 512);
+  for (let x = -ox; x < W; x += 512) for (let y = -oy; y < H; y += 512) out.drawImage(grain, x, y);
+  out.restore();
+}
+window.renderFrame = (frame) => {
+  const t0 = frame / FPS;
+  for (let i = 0; i < SUB; i++) {
+    const t = t0 + ((i + .5) / SUB - .5) * SHUTTER / FPS;
+    renderAt(Math.max(0, t));
+    out.globalAlpha = 1 / (i + 1);
+    out.drawImage(off, 0, 0);
+  }
+  out.globalAlpha = 1;
+  finish(frame);
+  return true;
+};
+window.META = { FPS, BPM, SPB, OFFSET, END_BEAT, TOTAL, FRAMES: Math.ceil(TOTAL * FPS), EVENTS: EVENTS.map(e => ({ ...e, t: OFFSET + e.beat * SPB })) };
+
+// fonts
+const fonts = [['Anton', 'fonts/anton.woff'], ['ArchivoBlack', 'fonts/archivoblack.woff'], ['Grotesk', 'fonts/grotesk.woff'], ['ArchivoVar', 'fonts/archivo-var.woff']];
+window.READY = Promise.all(fonts.map(([n, u]) => new FontFace(n, `url(${u})`, n === 'Grotesk' ? { weight: '300 700' } : {}).load().then(f => document.fonts.add(f))))
+  .then(() => document.fonts.load(F.mono(40, 700))).then(() => { window.renderFrame(+(P.get('f') || 0)); return true; });
+</script>
+</body></html>
